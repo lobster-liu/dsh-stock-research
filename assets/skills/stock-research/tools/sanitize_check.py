@@ -85,8 +85,10 @@ PII_RULES = [
     #    同一锚点下的宽松度，不再决定「是不是个人头寸」。
     # 豁免：
     #   - 机构主语紧邻豁免（本基金/机构/公司…持有 N 亿元 = 公开披露），只对 A 生效；
-    #   - 观点句豁免（句首是 我认为/我觉得/… 且命中是 B1 所有格），见 _is_opinion；
     #   - 「我方」视为机构自述：从个人锚点移除，加入机构主语豁免。
+    # ⚠️ **不做观点句豁免**：新锚点（去掉裸「我」、改为自带自持语义）已修好
+    #    「我认为规模 3 亿元」这类误伤；而「我的份额 3 万元」在观点句里仍是
+    #    个人头寸，豁免它等于在决策账本留真实泄漏路径（见 CHANGELOG 0.6.6）。
     # ⚠️ 刻意不加「金额 + 元/万元」裸规则：会误伤基金披露份额、政策条款数字。
     ('personal_amount', 'CRITICAL',
      re.compile(
@@ -160,8 +162,10 @@ NEGATION_BEFORE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# 机构主语豁免：personal_amount 的 A 类锚点（持有/持仓/头寸…）机构与个人都会用。
-# 基金披露里「本基金持有 4.76 亿元」「机构持仓 3.39 亿份」是公开数据，不是个人头寸。
+# 机构主语豁免：personal_amount 的 A 类锚点（持有/持仓/头寸…）与 capital_amount 的
+# 资金/本金/仓位/投入…机构与个人都会用。
+# 基金披露里「本基金持有 4.76 亿元」「机构持仓 3.39 亿份」「我方资金 3 亿元」是公开数据，
+# 不是个人头寸。
 # **只**在锚点紧邻前文 ≤4 字符出现机构主语时豁免，绝不做整行豁免
 # （否则「基金规模扩大。同时我持有 3 万元」会被一起放过）。
 # 「我方」是资管/机构的自述口径，一并列入机构主语。
@@ -174,38 +178,10 @@ INST_SUBJECT_BEFORE = re.compile(
 )
 
 # personal_amount 锚点分三类（匹配串以锚点开头，据此分流豁免）：
-#   B1 第一人称 + 的 + 所有格名词（我的持仓/我的仓位…）→ 可走观点句豁免
-#   B2 第一人称 + 自持动词（我持有/我买了…）            → 最个人化，两条豁免都不走
+#   B1 第一人称 + 的 + 所有格名词（我的持仓/我的仓位…）→ 个人头寸，照拦
+#   B2 第一人称 + 自持动词（我持有/我买了…）            → 最个人化，照拦
 #   A  无主语强自持动词（持有/持仓/头寸/自有…）        → 可走机构主语豁免
-_ANCHOR_B1 = re.compile(r'^(?:我自己|自己|本人|我)(?:的)')
 _FIRST_PERSON_ANCHOR = re.compile(r'^(?:我自己|自己|本人|我)')
-
-# 观点句动词：句首出现这些词时，第一人称所有格（我的X）是作者对**公开数据**的判断，
-# 不是个人头寸。**只**对 B1 生效；B2（我持有/我买了）与 A（持有/持仓…）一律照拦。
-OPINION_VERBS = re.compile(
-    r'^(?:我认为|我觉得|我看|我判断|我预计|我建议|我推测|我想|我估计)'
-)
-
-# B1 所有格里与自持动词同名的名词：用户规则「持有/持仓…一律照拦，不给豁免」，
-# 故「我的持仓/我的持有」即使出现在观点句里也不豁免（真自持表达照拦）。
-_SELF_HOLDING_NOUNS = ('持有', '持仓')
-
-
-def _is_opinion(line: str, match_start: int, match_text: str) -> bool:
-    """观点句豁免：句首是观点动词 + 命中是第一人称所有格（B1）时放行。
-
-    ⚠️ 只认 B1（我的X）；「我认为我持有 3 万元」这类 B2 不豁免（真自持动词照拦）。
-    ⚠️ B1 里与自持动词同名的名词（我的持仓/我的持有）同样不豁免。
-    观点动词必须在**当前句句首**，不跨句（否则上一句的观点词会掩护本句的头寸）。
-    """
-    if not _ANCHOR_B1.match(match_text):
-        return False
-    m_num = re.search(r'\d', match_text)
-    anchor = match_text[:m_num.start()].strip() if m_num else match_text.strip()
-    if any(anchor.endswith(n) for n in _SELF_HOLDING_NOUNS):
-        return False
-    sent = re.split(r'[。；;！!？?\n]', line[:match_start])[-1]
-    return OPINION_VERBS.match(sent) is not None
 
 
 def _is_inst_sensitive(match_text: str) -> bool:
@@ -323,15 +299,14 @@ def scan_text(text: str, path: str):
                 # 财报科目豁免：资产负债表/利润表/现金流量表公开科目不是个人持仓信息
                 if _is_fin_statement(line, m.start(), m.group(0)):
                     continue
-                # 机构主语豁免：本基金/机构/公司…持有 N 亿元是公开披露，不是个人头寸
-                # 只对 A 类（无主语自持动词）生效，且只做紧邻局部豁免
-                if name == 'personal_amount':
-                    mtext = m.group(0)
-                    if _is_inst_sensitive(mtext):
-                        if INST_SUBJECT_BEFORE.search(line[:m.start()]):
-                            continue
-                    # 观点句豁免：句首观点动词 + 第一人称所有格（我的X）
-                    if _is_opinion(line, m.start(), mtext):
+                # 机构主语豁免：本基金/机构/公司…持有/资金 N 亿元是公开披露，不是个人头寸。
+                # personal_amount 只对 A 类（无主语自持动词）生效；capital_amount 的
+                # 资金/本金/仓位/投入…同样机构与个人通用，一并给紧邻机构主语豁免。
+                # 只做紧邻局部豁免（≤4 非数字字符），绝不整行豁免。
+                if name in ('personal_amount', 'capital_amount'):
+                    inst_ok = (name == 'capital_amount'
+                               or _is_inst_sensitive(m.group(0)))
+                    if inst_ok and INST_SUBJECT_BEFORE.search(line[:m.start()]):
                         continue
                 val = m.group(1) if m.groups() else m.group(0)
                 hits.append({
