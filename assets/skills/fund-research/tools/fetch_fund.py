@@ -43,7 +43,7 @@ except Exception:
 
 _PLUGIN_PKG_NAME = 'dsh-invest-research'
 # 单独拷走运行、又找不到本插件 package.json 时的回落值（与 package.json 同步）。
-_VERSION_FALLBACK = '0.6.7'
+_VERSION_FALLBACK = '0.6.8'
 
 
 def _resolve_version(start=None):
